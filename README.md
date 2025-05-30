@@ -1,2 +1,2 @@
 # ANL_Internship
-This repository holds all things I learned at Argonne.
+This repository holds all the things I learned at Argonne.

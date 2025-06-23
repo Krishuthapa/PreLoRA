@@ -2,6 +2,8 @@
 import torch
 import torch.nn as nn
 
+import torch.nn.functional as F
+
 class CrossEntropyLS(nn.Module):
     def __init__(self, eps: float = 0.2):
         super(CrossEntropyLS, self).__init__()
@@ -16,3 +18,15 @@ class CrossEntropyLS(nn.Module):
         cross_entropy_loss_tot = -targets_classes.mul(log_preds)
         cross_entropy_loss = cross_entropy_loss_tot.sum(dim=-1).mean()
         return cross_entropy_loss
+
+
+class SoftTargetCrossEntropy(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, inputs, targets):
+        # inputs: logits [B, C]
+        # targets: soft labels [B, C] (sum to 1)
+        log_preds = F.log_softmax(inputs, dim=-1)
+        loss = -(targets * log_preds).sum(dim=-1).mean()
+        return loss

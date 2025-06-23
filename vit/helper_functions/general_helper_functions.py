@@ -1,3 +1,5 @@
+from helper_functions.distributed import print_at_master
+
 def add_weight_decay(model, weight_decay=1e-4, skip_list=()):
     decay = []
     no_decay = []
@@ -32,16 +34,46 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-def accuracy(output, target, topk=(1,)):
+def accuracy2(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
+    
     maxk = max(topk)
     batch_size = target.size(0)
     _, pred = output.topk(maxk, 1, True, True)
     pred = pred.t()
     correct = pred.eq(target.reshape(1, -1).expand_as(pred))
+
+    return [correct[:k].reshape(-1).float().sum(0) * 100. / batch_size for k in topk]
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+
+    maxk = max(topk)
+    batch_size = target.size(0)
+    _, pred = output.topk(maxk, 1, True, True)                      
+    pred = pred.t()
+    correct = pred.eq(target.reshape(1, -1).expand_as(pred))
+
     return [correct[:k].reshape(-1).float().sum(0) * 100. / batch_size for k in topk]
 
 def silence_PIL_warnings():
     import PIL
     wa = PIL.Image.warnings
     wa.filterwarnings("ignore", "(Possibly )?corrupt EXIF data", UserWarning)
+
+class HookController:
+    def __init__(self, interval=10):
+        self.interval = interval
+        self.iteration = 0
+
+    def increment(self):
+        self.iteration += 1
+
+    def should_run(self):
+        return (self.iteration % self.interval) == 0
+
+def check_container_and_assign(container, key, default_value = None):
+    if key in check_container:
+        return container[key]
+    
+    return default_value

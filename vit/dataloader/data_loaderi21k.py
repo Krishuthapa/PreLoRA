@@ -4,6 +4,8 @@ import torch
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
+from torch.utils.data import Subset
+
 import random
 
 import numpy as np
@@ -12,6 +14,12 @@ from PIL import ImageDraw
 from timm.data.loader import OrderedDistributedSampler
 
 import torch.distributed as dist
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 class CutoutPIL(object):
     def __init__(self, cutout_factor=0.5):
@@ -30,6 +38,7 @@ class CutoutPIL(object):
         x1 = np.clip(x_c - w_cutout // 2, 0, w)
         x2 = np.clip(x_c + w_cutout // 2, 0, w)
         fill_color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+        
         img_draw.rectangle([x1, y1, x2, y2], fill=fill_color)
 
         return x
@@ -72,26 +81,49 @@ def num_distrib():
 
 def create_data_loaders(args):
     data_path_train = os.path.join(args.data_path, 'imagenet21k_train')
+    
     train_transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        CutoutPIL(cutout_factor=0.5),
-        transforms.RandAugment(),
-        transforms.ToTensor(),
+    transforms.RandomResizedCrop(args.image_size, scale=(0.08, 1.0), ratio=(3./4., 4./3.)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandAugment(num_ops=args.randaugment_num_ops, magnitude=args.randaugment_magnitude),
+    transforms.ToTensor(),
+    transforms.Normalize(
+       mean=[0.485, 0.456, 0.406],
+       std=[0.229, 0.224, 0.225]
+    )
     ])
 
     data_path_val = os.path.join(args.data_path, 'imagenet21k_val')
     val_transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
+        transforms.Resize(256),
+        transforms.CenterCrop(args.image_size),
         transforms.ToTensor(),
+        transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+       std=[0.229, 0.224, 0.225])
     ])
+
+    set_seed(100)
 
     train_dataset = ImageFolder(data_path_train, transform=train_transform)
     val_dataset = ImageFolder(data_path_val, transform=val_transform)
-    print_at_master("length train dataset: {}".format(len(train_dataset)))
-    print_at_master("length val dataset: {}".format(len(val_dataset)))
+
+    ########################### Subsets ##############################################################
+    # train_indices = np.random.choice(len(train_dataset), size=50000, replace=False)
+    # val_indices = np.random.choice(len(val_dataset), size=2000, replace=False)
+
+    # train_dataset = Subset(train_dataset, train_indices)
+    # val_dataset = Subset(val_dataset, val_indices)
+    ########################### Subsets ##############################################################
+
+    print_at_master("length subset train dataset: {}".format(len(train_dataset)))
+    print_at_master("length subset val dataset: {}".format(len(val_dataset)))
+
+    rank, world_size = get_dist_info()
 
     sampler_train = None
     sampler_val = None
+    
     if num_distrib() > 1:
         sampler_train = torch.utils.data.distributed.DistributedSampler(train_dataset)
         sampler_val = OrderedDistributedSampler(val_dataset)
@@ -99,14 +131,14 @@ def create_data_loaders(args):
     # Pytorch Data loader
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=sampler_train is None,
-        num_workers=args.num_workers, pin_memory=True, sampler=sampler_train)
+        num_workers=args.num_workers, pin_memory=True, sampler=sampler_train, drop_last=True)
 
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=False, sampler=sampler_val)
 
-    train_loader = PrefetchLoader(train_loader)
-    val_loader = PrefetchLoader(val_loader)
+    # train_loader = PrefetchLoader(train_loader)
+    # val_loader = PrefetchLoader(val_loader)
     return train_loader, val_loader
 
 

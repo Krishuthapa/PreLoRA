@@ -5,8 +5,13 @@ This repository holds all the things I learned at Internship.
 
 ### For ViT model:
 
-```Lucidrain VIT```: https://github.com/lucidrains/vit-pytorch/tree/main/vit_pytorch
+```Huggingface ViT```: https://huggingface.co/docs/transformers/model_doc/vit#transformers.ViTForImageClassification
 
 ### For Imagenet-21K training:
 
 ```ALIBABA MIIL```: https://github.com/Alibaba-MIIL/ImageNet21K/tree/main
+
+### For ImageNet Scratch Training Configuration
+
+```ViT AugReg```: https://arxiv.org/abs/2106.10270
+

@@ -25,8 +25,6 @@ from helper_functions.general_helper_functions import accuracy, AverageMeter, si
 from helper_functions.optimizers import create_optimizer_adam
 from helper_functions.losses import CrossEntropyLS, SoftTargetCrossEntropy
 
-from model.vit_huge import ViT_Huge_patch14
-
 from transformers import ViTConfig, ViTForImageClassification
 
 import random
@@ -115,8 +113,6 @@ def main():
                     num_labels = args.num_classes)
 
     model = ViTForImageClassification(model_config).to(local_rank)
-
-    # model = ViT_Large_patch16(num_classes = args.num_classes, patch_size=args.patch_size ).to(local_rank)
     model = to_ddp(model,args,local_rank)
 
     if global_rank == 0:

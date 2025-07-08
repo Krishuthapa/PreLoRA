@@ -31,14 +31,14 @@ def setup_distrib(args):
         torch.cuda.set_device(local_rank)
 
         
-def to_ddp(model,args, local_rank = None):
+def to_ddp(model,args, local_rank = None, enable_unused = False):
     if num_distrib() > 1:
         if local_rank is not None:
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank]) if not enable_unused else torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], enable_unused_params=True) 
             return model
 
         if local_rank in args:
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank]) if not enable_unused else torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], enable_unused_params=True) 
 
     return model
 

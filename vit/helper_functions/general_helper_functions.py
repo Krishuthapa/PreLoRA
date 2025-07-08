@@ -73,7 +73,7 @@ class HookController:
         return (self.iteration % self.interval) == 0
 
 def check_container_and_assign(container, key, default_value = None):
-    if key in check_container:
+    if key in container:
         return container[key]
     
     return default_value

@@ -215,12 +215,6 @@ def train_21k(model, train_loader, val_loader, optimizer, args):
             optimizer.zero_grad()            
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-
-            # if i% 100 == 0 and i > 0 and global_rank == 0:
-            #     for name, param in model.named_parameters():
-            #         if param.grad is not None:
-            #             print_at_master(f"[{name}] grad mean: {param.grad.abs().mean().item()}")
-            #     print_at_master("=====================================================================")
                 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
@@ -290,7 +284,7 @@ def train_21k(model, train_loader, val_loader, optimizer, args):
                     'val_top1_losses': torch.tensor(val_top1_losses),
                     'val_top5_losses': torch.tensor(val_top5_losses),
                     'epoch_losses': torch.tensor(epoch_losses)
-            },"/lus/grand/projects/datascience/kthapa/vit-lucidrain/checkpoint_large/vit_checkpoint_{}_{}.pth".format(args.model_name,epoch))
+            },"/paper_checkpoints/full_run/vit_checkpoint_{}_{}.pth".format(args.model_name,epoch))
 
         model.train()
 

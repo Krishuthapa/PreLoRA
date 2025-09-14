@@ -4,6 +4,8 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 
+from collections import defaultdict
+
 from utils.param_utils import get_percent_change_in_norm
 from utils.weight_decay_utils import powerlaw_tail_custom, exponential_decay, linear_decay
 
@@ -15,9 +17,6 @@ from helper_functions.distributed import print_at_master
 # ('query','key', etc) for all the layers.
 def get_overall_percentage_change(component_change, decay='none', last_weight = 0.5):
     n_layers = max(component_change.keys()) + 1
-
-    print_at_master("Component Change")
-    print_at_master(component_change)
 
     if decay == 'power':
         weights_decay = powerlaw_tail_custom(n_layers, last_weight)
@@ -40,13 +39,9 @@ def get_overall_percentage_change(component_change, decay='none', last_weight = 
 # percentage changes between losses are within a specified threshold.
 def check_loss_convergence(losses, threshold, checking_step):
     keys = sorted([int(key) for key in losses.keys()])
-    are_consecutive_keys = all(b-a == checking_step for a,b in zip(keys,keys[1:]))
-
-    assert are_consecutive_keys, f"Losses are not stored for {len(losses)} consecutive windows of {checking_step} iterations each."
     
     percent_changes = [(abs(losses[b]-losses[a])/float(losses[a]) * 100) for a,b in zip(keys,keys[1:])]
 
-    print_at_master("Percent changes")
     print_at_master(percent_changes)
 
     return all([change <= threshold for change in percent_changes])
@@ -77,9 +72,8 @@ def check_norms_convergence(norms, threshold):
         # {'query': 15 , 'key': 12}
         for module_family in module_layer_wc.keys():
             module_change = get_overall_percentage_change(module_layer_wc[module_family], decay='none', last_weight= 0.45)
-            
-            print_at_master(f"Module changes : {module_family}")
-            print_at_master(module_change)
+
+            print_at_master(f"{module_family}: {module_change}")
 
             convergence_result_holder.append(module_change < threshold)
 
@@ -98,13 +92,12 @@ def check_and_remove_unnecessary_metric(metric_store, balance = 3):
     
     return new_metric_store
 
-
-def check_partial_convergence(losses, weights, thr_loss = 10, thr_norms = 5, checking_step = 1000, checking_window = 3):
+def check_partial_convergence(args, losses, weights, thr_loss = 10, thr_norms = 5, checking_step = 1000, checking_window = 3):
     is_loss_converged = False
     is_weight_converged = False
 
     if len(losses.keys()) >= checking_window and len(weights.keys()) >= checking_window:
-        is_loss_converged = check_loss_convergence(losses, thr_loss, checking_step)
+        is_loss_converged = check_loss_convergence(losses, thr_loss, checking_step * args.grad_accum_steps)
         is_norms_converged = check_norms_convergence(weights, thr_norms)
 
     return is_loss_converged and is_norms_converged
@@ -122,7 +115,6 @@ def get_lora_modules_gradient_changes(norms, threshold):
 
         for module_name in all_modules:
             layer_num, module_family, wc = get_percent_change_in_norm(module_name, norms_list[index][module_name], norms_list[index+1][module_name])
-            
             if module_name in convergence_result_holder:
                 convergence_result_holder[module_name].append(wc < threshold)
             else:
@@ -131,32 +123,32 @@ def get_lora_modules_gradient_changes(norms, threshold):
     return convergence_result_holder
 
 def get_lora_base_modules_to_freeze(selected_modules_grad_norms, threshold):
-    converged_modules = get_lora_modules_gradient_changes(selected_grad_norms)
-    consecutive_windows = len(selected_grad_norms.keys())
+    converged_modules = get_lora_modules_gradient_changes(selected_modules_grad_norms, threshold)
+    consecutive_windows = len(selected_modules_grad_norms.keys())
 
     lora_status = defaultdict(lambda: {'lora_A': [], 'lora_B': []})
     
     # Aggregate convergence info for A and B
-    for module_name, status_list in convergence_results.items():
-        if '.lora_A' in module_name:
-            parent = module_name.replace('.lora_A', '')
-            lora_status[parent]['lora_A'] = status_list
-        elif '.lora_B' in module_name:
-            parent = module_name.replace('.lora_B', '')
-            lora_status[parent]['lora_B'] = status_list
-
-    base_layers_to_freeze = []
+    for module_name, status_list in converged_modules.items():
+        if '.base_layer' in module_name:
+            parent = module_name.replace('.base_layer', '')
+            lora_status[parent]['base_layer'] = status_list
+    
+    base_layers_to_freeze = [None]
     
     # Check if both A and B are converged for all windows (or last N windows)
     for parent_module, status in lora_status.items():
-        a_converged = status['lora_A'][-consecutive_windows:] if status['lora_A'] else []
-        b_converged = status['lora_B'][-consecutive_windows:] if status['lora_B'] else []
+        base_converged = status['base_layer'][-consecutive_windows:] if status['base_layer'] else []
 
-        if a_converged and b_converged and all(a_converged) and all(b_converged):
+        if base_converged and all(base_converged) and base_layers_to_freeze[0] is None:
+            base_layers_to_freeze = [parent_module + '.base_layer']
+        elif base_converged and all(base_converged) and base_layers_to_freeze[0] is not None:
             base_layers_to_freeze.append(parent_module + '.base_layer')
+    
+    print_at_master("Base layer to freeze")
+    print_at_master(base_layers_to_freeze)
 
     return base_layers_to_freeze
-
 
 # Code for the hook injected to check the activation of base weights and lora weights.
 def check_activation_change(module_name, threshold, hook_ctrl):
@@ -192,7 +184,7 @@ def check_activation_change(module_name, threshold, hook_ctrl):
         ratio = (lora_act_norm / base_act_norm) * 100 if base_act_norm > 0 else 0.0
 
         if ratio < threshold:
-            print(f"Freezing back {module_name} and freezing base_layer.")
+            print_at_master(f"Freezing back {module_name} and freezing base_layer.")
 
             for param in module.base_layer.parameters():
                 param.requires_grad = False

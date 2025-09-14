@@ -23,7 +23,7 @@ def is_t_test_passed(list1,list2):
 
   return p_value < 0.05 
 
-def get_total_iteration_count(data_count, world_size, epochs, batch_size):
-  num_iteration_per_epoch = (data_count // world_size) // batch_size
+def get_total_iteration_count(data_count, world_size, epochs, batch_size, accum_steps = 2):
+  num_iteration_per_epoch = (data_count // world_size) // (batch_size * accum_steps)
 
   return epochs * num_iteration_per_epoch

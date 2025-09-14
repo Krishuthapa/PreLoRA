@@ -3,11 +3,11 @@ import os
 import torch
 
 from helper_functions.distributed import print_at_master, to_ddp
-from helper_functions.schedulers import update_scheduler
+from helper_functions.schedulers import update_scheduler, scheduler_with_short_warmup
 from helper_functions.optimizers import update_optimizer
 from helper_functions.general_helper_functions import check_container_and_assign
 
-def initialize_vars_dora(checkpoint_path, model, optimizer, scheduler, scaler, args, alternate=True):
+def initialize_vars_dora(checkpoint_path, model, optimizer, scheduler, scaler, args, total_images=1.28e6):
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -27,13 +27,16 @@ def initialize_vars_dora(checkpoint_path, model, optimizer, scheduler, scaler, a
                     param.requires_grad = False
         
         learning_rate = check_container_and_assign(checkpoint,'learning_rate', 0.0)
-        iteration_counter = check_container_and_assign(checkpoint,'iteration_counter',checkpoint['epoch'] * int(1.28e6/ (args.batch_size * 64)))
+        iteration_counter = check_container_and_assign(checkpoint,'iteration_counter',checkpoint['epoch'] * int(total_images/ (args.batch_size * world_size * args.grad_accum_steps)))
+        is_dora_initialized = check_container_and_assign(checkpoint,'is_dora_initialized', False)
 
-        if alternate:
+        print_at_master(f"Learning rate intitialized: {learning_rate}")
+
+        if is_dora_initialized:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-            optimizer = update_optimizer(model, learning_rate, args)
-            scheduler = update_scheduler(args, optimizer, scheduler, world_size, iteration_counter)
+            optimizer = update_optimizer(model, args.lr, args)
+            scheduler = update_scheduler(args, optimizer, scheduler, world_size, total_images)
         else:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -51,8 +54,13 @@ def initialize_vars_dora(checkpoint_path, model, optimizer, scheduler, scaler, a
         is_frozen = check_container_and_assign(checkpoint,'is_frozen', False)
         targeted_lora_parent_modules = check_container_and_assign(checkpoint,'targeted_lora_parent_modules',[])
         k1_total_loss = check_container_and_assign(checkpoint, 'k1_total_loss', 0.0)
-    else:
 
+        first_freeze = check_container_and_assign(checkpoint, 'first_freeze', False)
+        freeze_starts = check_container_and_assign(checkpoint, 'freeze_starts', 0)
+        dora_starts = check_container_and_assign(checkpoint, 'dora_starts', 0)
+        is_all_base_layers_frozen = check_container_and_assign(checkpoint,'is_all_base_layers_frozen', False)
+
+    else:
         start_epoch = 0
         val_top1_losses = []
         val_top5_losses = []
@@ -66,5 +74,10 @@ def initialize_vars_dora(checkpoint_path, model, optimizer, scheduler, scaler, a
         is_frozen = False
         iteration_counter = 0
         k1_total_loss = 0.0
+
+        first_freeze=False
+        freeze_starts=0
+        dora_starts=0
+        is_all_base_layers_frozen=False
     
-    return (model, optimizer, scheduler, scaler, start_epoch, val_top1_losses, val_top5_losses, epoch_losses, stored_k1_weight_norms, stored_k1_grad_norms, stored_k1_losses, targeted_lora_parent_modules, is_dora_initialized, is_frozen, iteration_counter, k1_total_loss)
+    return (model, optimizer, scheduler, scaler, start_epoch, val_top1_losses, val_top5_losses, epoch_losses, stored_k1_weight_norms, stored_k1_grad_norms, stored_k1_losses, targeted_lora_parent_modules, is_dora_initialized, is_frozen, iteration_counter, k1_total_loss, first_freeze, freeze_starts, dora_starts, is_all_base_layers_frozen)

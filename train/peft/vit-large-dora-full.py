@@ -20,19 +20,20 @@ from peft import get_peft_model, LoraConfig, TaskType
 
 from dataloader.data_loaderi1k import create_data_loaders
 from helper_functions.distributed import print_at_master, to_ddp, reduce_tensor, num_distrib, setup_distrib, get_dist_info
-from helper_functions.general_helper_functions import accuracy, AverageMeter, silence_PIL_warnings
+from helper_functions.general_helper_functions import accuracy, AverageMeter, silence_PIL_warnings, HookController
 
-from helper_functions.optimizers import create_optimizer_adam, update_optimizer
-from helper_functions.schedulers import get_scheduler, update_scheduler
+from helper_functions.optimizers import create_optimizer_adam
+from helper_functions.schedulers import get_scheduler, update_scheduler, scheduler_with_short_warmup
+from helper_functions.optimizers import update_optimizer
 from helper_functions.losses import CrossEntropyLS, SoftTargetCrossEntropy
-from helper_functions.convergence import check_partial_convergence, check_and_remove_unnecessary_metric, check_activation_change
-from helper_functions.dora_instantiate import instantiate_dora_model
+from helper_functions.convergence import check_partial_convergence, check_and_remove_unnecessary_metric, check_activation_change, get_lora_base_modules_to_freeze
+from helper_functions.dora_instantiate import instantiate_dora_model, freeze_base_layer_params
 
 from transformers import ViTConfig, ViTForImageClassification
 
-from utils.param_utils import get_selected_modules_norms, average_module_norms_across_gpus
 from utils.general_utils import get_total_iteration_count
 from utils.initialize_vars import initialize_vars_dora
+from utils.param_utils import get_selected_modules_norms, average_module_norms_across_gpus, get_norms_from_selected_lora_modules
 
 import random
 import numpy as np
@@ -62,6 +63,9 @@ parser.add_argument("--dropout", default=0.1, type=float)
 parser.add_argument("--drop_path_rate", default=0.0, type=float)
 parser.add_argument("--wandb_name", default='vit-hf', type=str)
 parser.add_argument("--model_name", default='LARGE', type=str)
+parser.add_argument("--grad_accum_steps", default=2,type=int)
+parser.add_argument("--freeze_warmup_steps", default=300,type=int)
+parser.add_argument("--dora_warmup_steps", default=1000,type=int)
 
 
 # Mixup / CutMix
@@ -82,6 +86,7 @@ parser.add_argument("--k1_loss_thr", default=10.0,type=float)
 parser.add_argument("--k1_wc_thr", default=5.0,type=float)
 parser.add_argument("--k2_steps", default=100,type=int)
 parser.add_argument("--k2_freeze_thr", default=10, type=float)
+parser.add_argument("--k2_consecutive_window", default=4, type=int)
 parser.add_argument("--lora_scaling", default=2, type=int)
 parser.add_argument("--lora_dropout", default=0.0, type=float)
 parser.add_argument("--low_rank", default=4, type=int)
@@ -89,6 +94,7 @@ parser.add_argument("--high_rank", default=32, type=int)
 parser.add_argument("--default_rank", default=8, type=int)
 parser.add_argument("--has_lora", default=0, type=int)
 parser.add_argument("--lora_cfg_pth", type=str)
+parser.add_argument("--checkpoint_dir", default="/vit-lucidrain/checkpoint_dora_exp_1", type=str)
 parser.add_argument("--selected_modules", default="attention.query,attention.value", type=str)
 
 def get_mixup(args):
@@ -138,16 +144,19 @@ def get_initialzed_model(args, local_rank):
                     rank_pattern = lora_config.get('rank_pattern', None),
                     alpha_pattern = lora_config.get('alpha_pattern', None),
                     lora_alpha = lora_config.get('lora_alpha', None),
-                    lora_dropout = lora_config.get('lora_dropout', None))
+                    lora_dropout = lora_config.get('lora_dropout', None),
+                    use_dora=lora_config.get('use_dora', False))
             
             model = get_peft_model(model,peft_config)
+            model.print_trainable_parameters()
 
     model = to_ddp(model,args,local_rank)
 
     return model
 
 def save_model(args, model, optimizer, scheduler, epoch, scaler, val_top1_losses, val_top5_losses, epoch_losses,is_dora_initialized, is_frozen, 
-               targeted_lora_parent_modules, k1_total_loss, iteration_counter, stored_k1_weight_norms,stored_k1_grad_norms, stored_k1_losses):
+               targeted_lora_parent_modules, k1_total_loss, iteration_counter, stored_k1_weight_norms,stored_k1_grad_norms, stored_k1_losses, first_freeze, freeze_starts,
+               dora_starts):
     
     trainable_params = [name for name, param in model.module.named_parameters() if param.requires_grad]
     
@@ -168,8 +177,12 @@ def save_model(args, model, optimizer, scheduler, epoch, scaler, val_top1_losses
             'iteration_counter': iteration_counter,
             'stored_k1_weight_norms': stored_k1_weight_norms,
             'stored_k1_grad_norms':stored_k1_grad_norms,
-            'stored_k1_losses':stored_k1_losses
-    },"/lus/grand/projects/datascience/kthapa/vit-lucidrain/checkpoint_dora/vit_checkpoint_dora_{}_{}.pth".format(args.model_name,epoch))
+            'stored_k1_losses':stored_k1_losses,
+            'learning_rate': optimizer.param_groups[0]['lr'] ,
+            'first_freeze' : first_freeze,
+            'freeze_starts' : freeze_starts,
+            'dora_starts':dora_starts
+    },"{}/vit_checkpoint_dora_ex2_{}_{}.pth".format(args.checkpoint_dir, args.model_name,epoch))
 
 def main():
     # arguments
@@ -188,7 +201,8 @@ def main():
     set_seed(100)
 
     model = get_initialzed_model(args,local_rank)
-    
+    # model.module.print_trainable_parameters()
+
     if global_rank == 0:
         wandb.login()
         wandb.init(project=args.wandb_name, config = args)
@@ -209,7 +223,7 @@ def train_21k(model, train_loader, val_loader, optimizer, args):
     local_rank = int(os.environ.get('LOCAL_RANK'))
 
     # set scheduler
-    scheduler = get_scheduler(args, optimizer, world_size)
+    scheduler = get_scheduler(args, optimizer, world_size, 1.28e6)
     
     # set scalaer
     scaler = GradScaler(device='cuda')
@@ -219,10 +233,9 @@ def train_21k(model, train_loader, val_loader, optimizer, args):
     selected_modules = args.selected_modules.split(',')
 
     #############Checks for the checkpoint and if not assigns the defaults values to the variables.##############
-    all_vars = initialize_vars_dora(args.checkpoint_path, model, optimizer, scheduler, scaler, args, alternate = False)
-    
+    all_vars = initialize_vars_dora(args.checkpoint_path, model, optimizer, scheduler, scaler, args)
     model = all_vars[0]
-    optmizer = all_vars[1]
+    optimizer = all_vars[1]
     scheduler = all_vars[2]
     scaler = all_vars[3]
     start_epoch = all_vars[4]
@@ -237,10 +250,13 @@ def train_21k(model, train_loader, val_loader, optimizer, args):
     is_frozen = all_vars[13]
     iteration_counter = all_vars[14]
     k1_total_loss = all_vars[15]
+    first_freeze = all_vars[16]
+    freeze_starts = all_vars[17]
+    dora_starts = all_vars[18]
     #############################################################################################################
-    
-    print_at_master(f"Iteration counter: {iteration_counter}")
-    print_at_master(f"Total Iteration: {get_total_iteration_count(1.28e6, world_size, args.epochs, args.batch_size)}")
+
+    print_at_master(f"Iteration counter: {int(iteration_counter/args.grad_accum_steps)}")
+    print_at_master(f"Total Iteration: {get_total_iteration_count(1.28e6, world_size, args.epochs, args.batch_size, args.grad_accum_steps)}")
      
     # training loop
     for epoch in range(start_epoch, args.epochs):
@@ -268,13 +284,14 @@ def train_21k(model, train_loader, val_loader, optimizer, args):
                 output = model(input)
                 loss = loss_fn(output.logits, target)  # note - loss also in fp16
                 
-            optimizer.zero_grad()            
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+
+            if (i + 1) % args.grad_accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
 
             loss_collector = loss.detach().clone()
 
@@ -302,7 +319,11 @@ def train_21k(model, train_loader, val_loader, optimizer, args):
             ############################################## LoRA check and implementation ########################################
             should_switch = torch.tensor([0], device=f"cuda:{local_rank}")
 
-            if (iteration_counter % args.k1_steps == 0 and not is_dora_initialized) or int(get_total_iteration_count(1.28e6, world_size, args.epochs, args.batch_size) * (1 / 2)) == int(iteration_counter):
+            check_step_reached_before_dora = iteration_counter % (args.k1_steps * args.grad_accum_steps) == 0
+            check_step_reached_after_dora = iteration_counter % (args.k2_steps * args.grad_accum_steps) == 0
+            is_dora_warmup_done = is_dora_initialized and int(iteration_counter/args.grad_accum_steps) - dora_starts >=  args.dora_warmup_steps
+
+            if  check_step_reached_before_dora and not is_dora_initialized:
                 k1_selected_weight_norms, k1_selected_grad_norms = get_selected_modules_norms(model, selected_modules)
 
                 k1_selected_weight_norms = average_module_norms_across_gpus(k1_selected_weight_norms, local_rank)
@@ -314,57 +335,101 @@ def train_21k(model, train_loader, val_loader, optimizer, args):
 
                 k1_total_loss = 0.0
 
-            if global_rank == 0 and not is_dora_initialized and int(get_total_iteration_count(1.28e6, world_size, args.epochs, args.batch_size) * (1 / 2)) == int(iteration_counter):
-                should_switch[0] = 1
-            
-            dist.broadcast(should_switch, src=0)
-            
-            if should_switch.item() == 1 and not is_dora_initialized:
+            if check_step_reached_before_dora and not is_dora_initialized and len(stored_k1_grad_norms.keys()) >= int(args.consecutive_windows):
                 stored_k1_losses = check_and_remove_unnecessary_metric(stored_k1_losses, args.consecutive_windows)
                 stored_k1_weight_norms = check_and_remove_unnecessary_metric(stored_k1_weight_norms, args.consecutive_windows)
                 stored_k1_grad_norms = check_and_remove_unnecessary_metric(stored_k1_grad_norms, args.consecutive_windows)
+
+            if global_rank == 0 and check_step_reached_before_dora and not is_dora_initialized and len(stored_k1_grad_norms.keys()) >= int(args.consecutive_windows) and (i + 1) % args.grad_accum_steps == 0:                
+                is_partially_converged = check_partial_convergence(args,stored_k1_losses, stored_k1_weight_norms, thr_loss= args.k1_loss_thr, thr_norms = args.k1_wc_thr, checking_step = args.k1_steps, checking_window = args.consecutive_windows)
                 
+                if is_partially_converged:
+                    should_switch[0] = 1
+
+            if not is_dora_initialized:
+                dist.broadcast(should_switch, src=0)
+            
+            if should_switch.item() == 1 and not is_dora_initialized:                
                 dora_initialize_start = time.time()
-                model, optimizer, scheduler, targeted_lora_parent_modules = instantiate_dora_model(model, optimizer, scheduler, args, selected_modules, stored_k1_grad_norms, iteration_counter)
+                model, optimizer, scheduler, targeted_lora_parent_modules = instantiate_dora_model(model, optimizer, scheduler, args, selected_modules, stored_k1_grad_norms,iteration_counter, use_dora = False)
                 dora_initialize_end = time.time()
 
                 is_dora_initialized = True
+                dora_starts = int(iteration_counter / args.grad_accum_steps)
+
+                stored_k1_weight_norms = {}
+                stored_k1_grad_norms = {}
+
+                selected_weight_norms, selected_grad_norms = get_norms_from_selected_lora_modules(model,targeted_lora_parent_modules)
+                stored_k1_weight_norms[iteration_counter] = selected_weight_norms
+                stored_k1_grad_norms[iteration_counter] = selected_grad_norms
 
                 if global_rank == 0:
+                    print_at_master(f"Initialization time: {dora_initialize_end - dora_initialize_start}")
+                    print_at_master(f"Dora initiated at epoch {epoch} and iteration: {iteration_counter}")
+                
                     model.module.print_trainable_parameters()
-
-            freeze_trigger = torch.tensor([0], device=f"cuda:{local_rank}")
-
-            if global_rank == 0 and is_dora_initialized and not is_frozen and int(get_total_iteration_count(1.28e6, world_size, args.epochs, args.batch_size) * (2 / 3)) == int(iteration_counter):
-                freeze_trigger[0] = 1
-
-            dist.broadcast(freeze_trigger, src=0)
+                    print_at_master(f"Learning Rate: {optimizer.param_groups[0]['lr']}")
             
-            if freeze_trigger.item() == 1 and not is_frozen:
-                base_model = model.module
+            if is_dora_warmup_done and check_step_reached_after_dora and (i + 1) % args.grad_accum_steps == 0:
+                selected_weight_norms, selected_grad_norms = get_norms_from_selected_lora_modules(model,targeted_lora_parent_modules)
+                stored_k1_weight_norms[iteration_counter] = selected_weight_norms
+                stored_k1_grad_norms[iteration_counter] = selected_grad_norms
+            
+            modules_to_freeze = [None]
 
-                for module in base_model.modules():
-                    if all(hasattr(module,attr) for attr in ['lora_A','lora_B', 'base_layer']):
-                        for param in module.base_layer.parameters():
-                            param.requires_grad = False                
+            if is_dora_warmup_done and check_step_reached_after_dora and len(stored_k1_weight_norms.keys()) >= args.k2_consecutive_window  and (i + 1) % args.grad_accum_steps == 0:
+                stored_k1_weight_norms = check_and_remove_unnecessary_metric(stored_k1_weight_norms, args.k2_consecutive_window)
+                stored_k1_grad_norms = check_and_remove_unnecessary_metric(stored_k1_grad_norms, args.k2_consecutive_window)
 
-                is_frozen = True
+                modules_to_freeze = get_lora_base_modules_to_freeze(stored_k1_weight_norms, threshold = args.k2_freeze_thr)
 
-                model = to_ddp(base_model, args, local_rank)
-                optimizer = update_optimizer(model, optimizer, args)
-                scheduler = update_scheduler(args,optimizer,world_size, iteration_counter)
+            if modules_to_freeze[0] is not None:
+                dist.broadcast_object_list(modules_to_freeze, src=0)
 
-                if global_rank == 0:
-                    model.module.print_trainable_parameters()
+            if modules_to_freeze[0] is not None and len(stored_k1_weight_norms.keys()) >= args.k2_consecutive_window and check_step_reached_after_dora and (i + 1) % args.grad_accum_steps == 0 and is_dora_warmup_done:
+                number_of_params_before = sum(p.numel() for p in model.module.parameters() if p.requires_grad)
+                model = freeze_base_layer_params(args, model, modules_to_freeze)
+                number_of_params_after = sum(p.numel() for p in model.module.parameters() if p.requires_grad)
+
+                stored_k1_weight_norms = {}
+                stored_k1_grad_norms = {}
+                
+                if number_of_params_after != number_of_params_before:
+                    if not first_freeze:
+                        first_freeze = True
+                        freeze_starts = int(iteration_counter / args.grad_accum_steps)
+                        print_at_master(f"Freezing at Epoch: {epoch} and iteration: {freeze_starts}")
+
+                    optimizer = update_optimizer(model, args.lr * 0.2, args)
+                    scheduler = scheduler_with_short_warmup(args, optimizer, scheduler, world_size) 
+
+                    if global_rank == 0:
+                        model.module.print_trainable_parameters()
+                
+                    print_at_master(f"Learning Rate After freeze: {optimizer.param_groups[0]['lr']}")
+
             #################################################################### LoRA implementation ends #############################################################
+            
             iteration_counter += 1
 
+            if (i + 1) % args.grad_accum_steps == 0:
+                optimizer.zero_grad()
+
             del input, target
-            torch.cuda.empty_cache()
+
+        if (i + 1) % args.grad_accum_steps != 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+        torch.cuda.empty_cache()
 
         epoch_time = time.time() - epoch_start_time
-        print_at_master(f"Iteration counter: {iteration_counter}")
-        print_at_master(f"Total Iteration: {get_total_iteration_count(1.28e6, world_size, args.epochs, args.batch_size)}")
+        print_at_master(f"Iteration counter: {int(iteration_counter/args.grad_accum_steps)}")
+        print_at_master(f"Total Iteration: {get_total_iteration_count(1.28e6, world_size, args.epochs, args.batch_size, args.grad_accum_steps)}")
 
         dist.all_reduce(correct_top1, op=dist.ReduceOp.SUM)
         dist.all_reduce(correct_top5, op=dist.ReduceOp.SUM)
@@ -372,6 +437,10 @@ def train_21k(model, train_loader, val_loader, optimizer, args):
 
         train_top1_acc = 100.0 * correct_top1.item() / total_samples.item()
         train_top5_acc = 100.0 * correct_top5.item() / total_samples.item()
+
+        if global_rank == 0 and is_dora_initialized:
+            print_at_master("before validation")
+            model.module.print_trainable_parameters()
 
         #validation epoch
         top1_loss, top5_loss = validate_21k(val_loader, model)
@@ -393,7 +462,7 @@ def train_21k(model, train_loader, val_loader, optimizer, args):
             epoch_losses.append(total_loss/num_batches)
 
             save_model(args, model, optimizer, scheduler, epoch, scaler, val_top1_losses, val_top5_losses, epoch_losses,is_dora_initialized, is_frozen, 
-               targeted_lora_parent_modules, k1_total_loss, iteration_counter, stored_k1_weight_norms,stored_k1_grad_norms, stored_k1_losses)
+               targeted_lora_parent_modules, k1_total_loss, iteration_counter, stored_k1_weight_norms,stored_k1_grad_norms, stored_k1_losses, first_freeze, freeze_starts, dora_starts)
 
         model.train()
 

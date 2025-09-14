@@ -26,9 +26,15 @@ def get_layer_number_and_family(param_name):
 
 # Calcualte the l2 distance between the tensors of a given param at two stages.
 # Convert the l2 distance to the percentage change in the value.
-def get_percent_change_in_norm(param_name, v1,v2, eps=1e-8):
+def get_percent_change_in_norm(param_name, v1,v2, eps=1e-12):
     layer_number, layer_family = get_layer_number_and_family(param_name)
-    percent_change =abs((v2-v1)/v1) * 100
+
+    if abs(v1) < eps and abs(v2-v1) < eps:
+        percent_change = 0.0
+    elif abs(v1) < eps and not abs(v2-v1) < eps:
+        percent_change = float('inf')
+    else:  
+        percent_change = abs((v2-v1)/v1) * 100
 
     return layer_number, layer_family, percent_change
 
@@ -114,6 +120,12 @@ def is_one_of_module(module_name, comparisions):
 
     return any(results)
 
+def is_one_of_module_upd(module_name, comparisons):
+    for comp in comparisons:
+        if re.search(re.escape(comp), module_name):
+            return True
+    return False
+
 def get_selected_modules_norms(model, selected_modules):
     selected_modules_weights_norms = {}
     selected_modules_grad_norms = {}
@@ -125,6 +137,26 @@ def get_selected_modules_norms(model, selected_modules):
                 selected_modules_grad_norms[name] = module.weight.grad.norm().item()
     
     return selected_modules_weights_norms, selected_modules_grad_norms
+
+def get_selected_modules_lora_norms(model, selected_modules):
+    selected_modules_weights_norms = {}
+
+    for name, module in model.named_modules():
+        if is_one_of_module_upd(name, selected_modules):
+            if hasattr(module, 'base_layer') and hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                scaling = module.scaling['default']
+                local_delta = module.lora_B['default'].weight @ module.lora_A['default'].weight * scaling
+                
+                merged_weights = module.base_layer.weight + local_delta
+
+                print_at_master(f"Module name : {name} => Base layer before : {module.base_layer.weight.norm()} and after: {merged_weights.data.norm()}")
+                print_at_master(f"Just lora weight norms: {(module.lora_B['default'].weight @ module.lora_A['default'].weight).norm()} and scaling: {module.scaling['default']}")
+                print_at_master(f"Shape: {module.lora_B['default'].weight.shape} and {module.lora_A['default'].weight.shape} and {local_delta.shape}")
+                print_at_master("===================================================")
+
+                selected_modules_weights_norms[name] = merged_weights.data.norm().item()
+    
+    return selected_modules_weights_norms
 
 def get_norms_from_selected_lora_modules(model, selected_module_names):
     weight_norms = {}
@@ -149,17 +181,19 @@ def get_norms_from_selected_lora_modules(model, selected_module_names):
             # LoRA B
             if hasattr(module, "lora_B") and module.lora_B['default'].weight.grad is not None:
                 key = f"{name}.lora_B"
-                weight_norms[key] = module.lora_B.weight['default'].data.norm().item()
-                grad_norms[key] = module.lora_B.weight['default'].grad.norm().item()
+                weight_norms[key] = module.lora_B['default'].weight.data.norm().item()
+                grad_norms[key] = module.lora_B['default'].weight.grad.norm().item()
 
     return weight_norms, grad_norms
 
 def average_module_norms_across_gpus(norm_dict, local_rank):
     averaged = {}
+
     for name, val in norm_dict.items():
         val = torch.tensor(val).to(torch.device(f"cuda:{local_rank}"))
         val_clone = val.clone()
         dist.all_reduce(val_clone, op=dist.ReduceOp.SUM)
         val_clone /= dist.get_world_size()
         averaged[name] = val_clone
+
     return averaged

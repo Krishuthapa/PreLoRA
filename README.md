@@ -1,4 +1,4 @@
-### PreLORA: PreLoRA: Hybrid Pre-training of Vision Transformers with Full Training and Low-Rank Adapters
+### PreLoRA: Hybrid Pre-training of Vision Transformers with Full Training and Low-Rank Adapters
 
 Optimizing Pre-training of ViT models on the ImageNet datasets.
 

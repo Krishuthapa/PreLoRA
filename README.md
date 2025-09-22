@@ -7,6 +7,7 @@ Model used: https://huggingface.co/docs/transformers/model_doc/vit#transformers.
 Dataset used: https://www.image-net.org/download.php (```ImageNet```)
 
 Libraries used: PEFT, PyTorch, DDP, matplotlib, etc
+
 Tools used: wandb
 
 ### For ImageNet Scratch Training Configuration

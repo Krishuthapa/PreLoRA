@@ -33,7 +33,8 @@ In 64 GPU, a speed-up of 9hrs, 3x throughput improvement and 20% lesser GPU util
 - Result are stored inside the corresponding exp folder inside **```PreLoRA/peft_final_plots```**
 - Code to generate plots can be found in **```PreLoRA/peft_final_plots/visualize_results_final.ipynb```** 
 
+If you have used our work or inspired the idea from this work, please cite us using this:
 
-
+Thapa, K. K., Barik, R., Chitty-Venkata, K. T., Emani, M., & Vishwanath, V. (2025). PreLoRA: Hybrid Pre-training of Vision Transformers with Full Training and Low-Rank Adapters. arXiv preprint arXiv:2509.21619.
 
 
